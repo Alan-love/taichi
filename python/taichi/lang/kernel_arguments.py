@@ -1,193 +1,155 @@
-from taichi.core.util import ti_core as _ti_core
+import inspect
+
+import taichi.lang
+from taichi._lib import core as _ti_core
+from taichi.lang import impl, ops
+from taichi.lang._texture import RWTextureAccessor, TextureSampler
 from taichi.lang.any_array import AnyArray
-from taichi.lang.enums import Layout
 from taichi.lang.expr import Expr
-from taichi.lang.snode import SNode
-from taichi.lang.sparse_matrix import SparseMatrixBuilder
-from taichi.lang.util import cook_dtype, to_taichi_type
-from taichi.type.primitive_types import u64
+from taichi.lang.matrix import MatrixType
+from taichi.lang.struct import StructType
+from taichi.lang.util import cook_dtype
+from taichi.types.primitive_types import RefType, u64
+from taichi.types.compound_types import CompoundType
 
 
-def ext_arr():
-    """Type annotation for external arrays.
-
-    External arrays are formally defined as the data from other Python frameworks.
-    For now, Taichi supports numpy and pytorch.
-
-    Example::
-
-        >>> @ti.kernel
-        >>> def to_numpy(arr: ti.ext_arr()):
-        >>>     for i in x:
-        >>>         arr[i] = x[i]
-        >>>
-        >>> arr = numpy.zeros(...)
-        >>> to_numpy(arr)  # `arr` will be filled with `x`'s data.
-    """
-    return ArgAnyArray()
-
-
-class ArgAnyArray:
-    """Type annotation for arbitrary arrays, including external arrays and Taichi ndarrays.
-
-    For external arrays, we can treat it as a Taichi field with Vector or Matrix elements by specifying element dim and layout.
-    For Taichi vector/matrix ndarrays, we will automatically identify element dim and layout. If they are explicitly specified, we will check compatibility between the actual arguments and the annotation.
-
-    Args:
-        element_dim (Union[Int, NoneType], optional): None if not specified (will be treated as 0 for external arrays), 0 if scalar elements, 1 if vector elements, and 2 if matrix elements.
-        layout (Union[Layout, NoneType], optional): None if not specified (will be treated as Layout.AOS for external arrays), Layout.AOS or Layout.SOA.
-    """
-    def __init__(self, element_dim=None, layout=None):
-        if element_dim is not None and (element_dim < 0 or element_dim > 2):
-            raise ValueError(
-                "Only scalars, vectors, and matrices are allowed as elements of ti.any_arr()"
-            )
-        self.element_dim = element_dim
-        self.layout = layout
-
-    def extract(self, x):
-        from taichi.lang.matrix import MatrixNdarray, VectorNdarray
-        from taichi.lang.ndarray import ScalarNdarray
-        if isinstance(x, ScalarNdarray):
-            self.check_element_dim(x, 0)
-            return x.dtype, len(x.shape), (), Layout.AOS
-        if isinstance(x, VectorNdarray):
-            self.check_element_dim(x, 1)
-            self.check_layout(x)
-            return x.dtype, len(x.shape) + 1, (x.n, ), x.layout
-        if isinstance(x, MatrixNdarray):
-            self.check_element_dim(x, 2)
-            self.check_layout(x)
-            return x.dtype, len(x.shape) + 2, (x.n, x.m), x.layout
-        # external arrays
-        element_dim = 0 if self.element_dim is None else self.element_dim
-        layout = Layout.AOS if self.layout is None else self.layout
-        shape = tuple(x.shape)
-        if len(shape) < element_dim:
-            raise ValueError(
-                f"Invalid argument into ti.any_arr() - required element_dim={element_dim}, but the argument has only {len(shape)} dimensions"
-            )
-        element_shape = (
-        ) if element_dim == 0 else shape[:
-                                         element_dim] if layout == Layout.SOA else shape[
-                                             -element_dim:]
-        return to_taichi_type(x.dtype), len(shape), element_shape, layout
-
-    def check_element_dim(self, arg, arg_dim):
-        if self.element_dim is not None and self.element_dim != arg_dim:
-            raise ValueError(
-                f"Invalid argument into ti.any_arr() - required element_dim={self.element_dim}, but {arg} is provided"
-            )
-
-    def check_layout(self, arg):
-        if self.layout is not None and self.layout != arg.layout:
-            raise ValueError(
-                f"Invalid argument into ti.any_arr() - required layout={self.layout}, but {arg} is provided"
-            )
-
-
-any_arr = ArgAnyArray
-"""Alias for :class:`~taichi.lang.kernel_arguments.ArgAnyArray`.
-
-Example::
-
-    >>> @ti.kernel
-    >>> def to_numpy(x: ti.any_arr(), y: ti.any_arr()):
-    >>>     for i in range(n):
-    >>>         x[i] = y[i]
-    >>>
-    >>> y = ti.ndarray(ti.f64, shape=n)
-    >>> ... # calculate y
-    >>> x = numpy.zeros(n)
-    >>> to_numpy(x, y)  # `x` will be filled with `y`'s data.
-"""
-
-
-class Template:
-    """Type annotation for template kernel parameter.
-
-    See also https://docs.taichi.graphics/lang/articles/advanced/meta.
-
-    Args:
-        tensor (Any): unused
-        dim (Any): unused
-    """
-    def __init__(self, tensor=None, dim=None):
-        self.tensor = tensor
-        self.dim = dim
-
-    def extract(self, x):
-        if isinstance(x, SNode):
-            return x.ptr
-        if isinstance(x, Expr):
-            return x.ptr.get_underlying_ptr_address()
-        if isinstance(x, _ti_core.Expr):
-            return x.get_underlying_ptr_address()
-        if isinstance(x, tuple):
-            return tuple(self.extract(item) for item in x)
-        return x
-
-
-template = Template
-"""Alias for :class:`~taichi.lang.kernel_arguments.Template`.
-"""
+class KernelArgument:
+    def __init__(self, _annotation, _name, _default=inspect.Parameter.empty):
+        self.annotation = _annotation
+        self.name = _name
+        self.default = _default
 
 
 class SparseMatrixEntry:
-    def __init__(self, ptr, i, j):
+    def __init__(self, ptr, i, j, dtype):
         self.ptr = ptr
         self.i = i
         self.j = j
+        self.dtype = dtype
 
-    def augassign(self, value, op):
-        from taichi.lang.impl import call_internal, ti_float
-        if op == 'Add':
-            call_internal("insert_triplet", self.ptr, self.i, self.j,
-                          ti_float(value))
-        elif op == 'Sub':
-            call_internal("insert_triplet", self.ptr, self.i, self.j,
-                          -ti_float(value))
+    def _augassign(self, value, op):
+        call_func = f"insert_triplet_{self.dtype}"
+        if op == "Add":
+            taichi.lang.impl.call_internal(call_func, self.ptr, self.i, self.j, ops.cast(value, self.dtype))
+        elif op == "Sub":
+            taichi.lang.impl.call_internal(call_func, self.ptr, self.i, self.j, -ops.cast(value, self.dtype))
         else:
-            assert False, f"Only operations '+=' and '-=' are supported on sparse matrices."
+            assert False, "Only operations '+=' and '-=' are supported on sparse matrices."
 
 
 class SparseMatrixProxy:
-    def __init__(self, ptr):
+    def __init__(self, ptr, dtype):
         self.ptr = ptr
+        self.dtype = dtype
 
     def subscript(self, i, j):
-        return SparseMatrixEntry(self.ptr, i, j)
+        return SparseMatrixEntry(self.ptr, i, j, self.dtype)
 
 
-sparse_matrix_builder = SparseMatrixBuilder
-"""Alias for :class:`~taichi.lang.sparse_matrix.SparseMatrixBuilder`.
-"""
-
-
-def decl_scalar_arg(dtype):
+def decl_scalar_arg(dtype, name, arg_depth):
+    is_ref = False
+    if isinstance(dtype, RefType):
+        is_ref = True
+        dtype = dtype.tp
     dtype = cook_dtype(dtype)
-    arg_id = _ti_core.decl_arg(dtype, False)
-    return Expr(_ti_core.make_arg_load_expr(arg_id, dtype))
+    if is_ref:
+        arg_id = impl.get_runtime().compiling_callable.insert_pointer_param(dtype, name)
+    else:
+        arg_id = impl.get_runtime().compiling_callable.insert_scalar_param(dtype, name)
+
+    argload_di = _ti_core.DebugInfo(impl.get_runtime().get_current_src_info())
+    return Expr(
+        _ti_core.make_arg_load_expr(arg_id, dtype, is_ref, create_load=True, arg_depth=arg_depth, dbg_info=argload_di)
+    )
 
 
-def decl_sparse_matrix():
+def get_type_for_kernel_args(dtype, name):
+    if isinstance(dtype, MatrixType):
+        # Compiling the matrix type to a struct type because the support for the matrix type is not ready yet on SPIR-V based backends.
+        if dtype.ndim == 1:
+            elements = [(dtype.dtype, f"{name}_{i}") for i in range(dtype.n)]
+        else:
+            elements = [(dtype.dtype, f"{name}_{i}_{j}") for i in range(dtype.n) for j in range(dtype.m)]
+        return _ti_core.get_type_factory_instance().get_struct_type(elements)
+    if isinstance(dtype, StructType):
+        elements = []
+        for k, element_type in dtype.members.items():
+            if isinstance(element_type, CompoundType):
+                new_dtype = get_type_for_kernel_args(element_type, k)
+                elements.append([new_dtype, k])
+            else:
+                elements.append([element_type, k])
+        return _ti_core.get_type_factory_instance().get_struct_type(elements)
+    # Assuming dtype is a primitive type
+    return dtype
+
+
+def decl_matrix_arg(matrixtype, name, arg_depth):
+    arg_type = get_type_for_kernel_args(matrixtype, name)
+    arg_id = impl.get_runtime().compiling_callable.insert_scalar_param(arg_type, name)
+    argload_di = _ti_core.DebugInfo(impl.get_runtime().get_current_src_info())
+    arg_load = Expr(
+        _ti_core.make_arg_load_expr(arg_id, arg_type, create_load=False, arg_depth=arg_depth, dbg_info=argload_di)
+    )
+    return matrixtype.from_taichi_object(arg_load)
+
+
+def decl_struct_arg(structtype, name, arg_depth):
+    arg_type = get_type_for_kernel_args(structtype, name)
+    arg_id = impl.get_runtime().compiling_callable.insert_scalar_param(arg_type, name)
+    argload_di = _ti_core.DebugInfo(impl.get_runtime().get_current_src_info())
+    arg_load = Expr(
+        _ti_core.make_arg_load_expr(arg_id, arg_type, create_load=False, arg_depth=arg_depth, dbg_info=argload_di)
+    )
+    return structtype.from_taichi_object(arg_load)
+
+
+def push_argpack_arg(name):
+    impl.get_runtime().compiling_callable.insert_argpack_param_and_push(name)
+
+
+def decl_argpack_arg(argpacktype, member_dict):
+    impl.get_runtime().compiling_callable.pop_argpack_stack()
+    return argpacktype.from_taichi_object(member_dict)
+
+
+def decl_sparse_matrix(dtype, name):
+    value_type = cook_dtype(dtype)
     ptr_type = cook_dtype(u64)
     # Treat the sparse matrix argument as a scalar since we only need to pass in the base pointer
-    arg_id = _ti_core.decl_arg(ptr_type, False)
-    return SparseMatrixProxy(_ti_core.make_arg_load_expr(arg_id, ptr_type))
+    arg_id = impl.get_runtime().compiling_callable.insert_scalar_param(ptr_type, name)
+    argload_di = _ti_core.DebugInfo(impl.get_runtime().get_current_src_info())
+    return SparseMatrixProxy(
+        _ti_core.make_arg_load_expr(arg_id, ptr_type, is_ptr=False, dbg_info=argload_di), value_type
+    )
 
 
-def decl_any_arr_arg(dtype, dim, element_shape, layout):
-    dtype = cook_dtype(dtype)
-    arg_id = _ti_core.decl_arg(dtype, True)
-    element_dim = len(element_shape)
-    if layout == Layout.AOS:
-        element_dim = -element_dim
-    return AnyArray(
-        _ti_core.make_external_tensor_expr(dtype, dim, arg_id, element_dim),
-        element_shape, layout)
+def decl_ndarray_arg(element_type, ndim, name, needs_grad, boundary):
+    arg_id = impl.get_runtime().compiling_callable.insert_ndarray_param(element_type, ndim, name, needs_grad)
+    return AnyArray(_ti_core.make_external_tensor_expr(element_type, ndim, arg_id, needs_grad, 0, boundary))
 
 
-def decl_scalar_ret(dtype):
-    dtype = cook_dtype(dtype)
-    return _ti_core.decl_ret(dtype)
+def decl_texture_arg(num_dimensions, name):
+    # FIXME: texture_arg doesn't have element_shape so better separate them
+    arg_id = impl.get_runtime().compiling_callable.insert_texture_param(num_dimensions, name)
+    dbg_info = _ti_core.DebugInfo(impl.get_runtime().get_current_src_info())
+    return TextureSampler(_ti_core.make_texture_ptr_expr(arg_id, num_dimensions, 0, dbg_info), num_dimensions)
+
+
+def decl_rw_texture_arg(num_dimensions, buffer_format, lod, name):
+    # FIXME: texture_arg doesn't have element_shape so better separate them
+    arg_id = impl.get_runtime().compiling_callable.insert_rw_texture_param(num_dimensions, buffer_format, name)
+    dbg_info = _ti_core.DebugInfo(impl.get_runtime().get_current_src_info())
+    return RWTextureAccessor(
+        _ti_core.make_rw_texture_ptr_expr(arg_id, num_dimensions, 0, buffer_format, lod, dbg_info), num_dimensions
+    )
+
+
+def decl_ret(dtype):
+    if isinstance(dtype, StructType):
+        dtype = dtype.dtype
+    if isinstance(dtype, MatrixType):
+        dtype = _ti_core.get_type_factory_instance().get_tensor_type([dtype.n, dtype.m], dtype.dtype)
+    else:
+        dtype = cook_dtype(dtype)
+    impl.get_runtime().compiling_callable.insert_ret(dtype)
